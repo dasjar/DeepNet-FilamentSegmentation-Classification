@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-"""fits-downloader.ipynb
-
-"""
-
 import os
 import json
 import requests

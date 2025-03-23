@@ -1,8 +1,4 @@
-# -*- coding: utf-8 -*-
-"""fits-correction.ipynb
-
-"""
-
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
@@ -12,6 +8,8 @@ from astropy.coordinates import SkyCoord
 from sunpy.map import all_coordinates_from_map
 import astropy.units as u  # Ensure correct unit usage
 from scipy.ndimage import gaussian_filter
+from PIL import Image
+
 
 def get_data(fits_file):
     # Load the map from the FITS file
@@ -51,7 +49,7 @@ def get_data(fits_file):
     data = s_map.data / map_correction
 
     # Normalize the data for better visualization (avoid extremes)
-    data[inside_disk_mask] = Normalize(0.8, 1.3, clip=True)(data[inside_disk_mask]) * 2 - 1  # Adjust normalization range
+    data[inside_disk_mask] = Normalize(0.6, 1.2, clip=True)(data[inside_disk_mask]) * 2 - 1  # Adjust normalization range
     data = np.nan_to_num(data, nan=-1)  # Replace NaN with -1
 
     # Contrast Enhancement: Stretch the data to increase contrast inside the disk
@@ -62,57 +60,74 @@ def get_data(fits_file):
     # Clip the values to ensure that the minimum and maximum are in the desired range
     data[inside_disk_mask] = np.clip(data[inside_disk_mask], -1, 1)
 
-    # Set the pixels outside the solar disk to gray (0.5 in normalized range [0, 1])
-    data[outside_disk_mask] = 0.2
-     # Set outside disk pixels to gray (128 in normalized range)
+    # Set the pixels outside the solar disk to a neutral background
+    data[outside_disk_mask] = 0.2  # Set outside disk pixels to a neutral background (lighter gray)
 
-    # Smooth the edge region to blend it seamlessly with the inner disk background
-    edge_radius_start = radius_pixels - 30  # Start 30 pixels inward from the edge
+    # Smooth the edge region to make the transition more natural
+    edge_radius_start = radius_pixels - 10  # Reduced edge smoothing range
     edge_radius_end = radius_pixels  # Outermost pixel of the disk
 
-    # Mask for edge pixels (30-pixel thickness around the circumference)
+    # Mask for edge pixels (10-pixel thickness around the circumference)
     edge_mask = (radial_distance >= edge_radius_start) & (radial_distance <= edge_radius_end)
 
-    # Apply Gaussian filter to the edge region for smooth transition
-    data[edge_mask] = gaussian_filter(data[edge_mask], sigma=5)  # Apply Gaussian filter for smoother transition
+    # Identify intermediate region inside the disk (not too bright and not too dark)
+    intermediate_mask = (data > -0.2) & (data < 0.7)  # This range can be adjusted to fit your image
 
-    # Gradually blend the edge with the inner solar disk (smooth transition)
-    data[edge_mask] = np.clip(data[edge_mask] + 0.1, -1, 1)  # Lighten edge pixels smoothly
+    # Use the values from the intermediate region to blend the edge
+    intermediate_values = data[intermediate_mask]
 
-    # Make white patches inside the solar disk whiter (further increase brightness of bright areas)
-    # Apply the mask to the entire image and then use the mask to select the pixels
-    white_patch_mask = (data >= 0.7)  # Identifying white patches (near the max intensity)
-    data[white_patch_mask] = np.clip(data[white_patch_mask] + 0.1, -1, 1)  # Make white patches whiter
+    # Calculate the mean intensity of the intermediate region
+    intermediate_mean = np.mean(intermediate_values)
 
-    # Darken filaments and sunspots (regions with low intensity)
+    # Set edge pixels to the mean value of the intermediate region to blend smoothly
+    data[edge_mask] = intermediate_mean
+
+    # Darken filaments and sunspots (regions with low intensity) and turn them completely black
     filament_mask = (data <= -0.2)  # Identifying darker regions (filaments/sunspots)
-    data[filament_mask] = np.clip(data[filament_mask] - 0.1, -1, 1)  # Darken the filaments and sunspots
+    data[filament_mask] = -1  # Set filaments to completely black
 
-    return data, center_x, center_y, radius_pixels
+    return data
 
-# Load FITS file and display the raw image
-fits_file = '/content/20110913000054Bh.fits.fz'
 
-with fits.open(fits_file) as hdul:
-    data = hdul[1].data
+def process_and_save_images(source_dir, output_dir):
+    """Process all FITS files in source_dir and save them to output_dir maintaining the directory structure."""
+    # Walk through all directories and subdirectories in source_dir
+    for root, dirs, files in os.walk(source_dir):
+        for file in files:
+            if file.endswith(".fits.fz"):  # Process only FITS files
+                fits_file_path = os.path.join(root, file)
+                print(f"Processing: {fits_file_path}")
 
-# Plot the raw FITS image
-plt.figure(figsize=(10, 5))
-plt.subplot(1, 2, 1)
-plt.imshow(data, cmap='gray', origin='lower')
-#plt.colorbar()  # Add a color bar to show intensity scale
-plt.axis('off')
-plt.title('Raw FITS Image')
+                # Apply the processing function
+                corrected_data = get_data(fits_file_path)
 
-# Apply corrections to the image and get center and radius information
-corrected_data, center_x, center_y, radius_pixels = get_data(fits_file)
+                # Create the corresponding output directory structure
+                relative_path = os.path.relpath(fits_file_path, source_dir)
+                output_path = os.path.join(output_dir, relative_path)
 
-# Plot the corrected image with the enhanced contrast and smoothened edge
-plt.subplot(1, 2, 2)
-plt.imshow(corrected_data, cmap='gray', origin='lower')
-#plt.colorbar()  # Add a color bar to show intensity scale
-plt.title('Corrected FITS image') # image with limb darkening removal &  brightness inhomogeneity removed
-plt.axis('off')
-# Show the plot
-plt.show()
+                # Ensure the output directory exists
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+                # Save the processed image
+                img_save_path = output_path.replace(".fits.fz", ".jpg")  # Change extension to .jpg
+                save_image_as_jpg(corrected_data, img_save_path)
+
+                print(f"Processed and saved: {img_save_path}")
+
+
+def save_image_as_jpg(image_data, save_path):
+    """Convert numpy array to image and save as .jpg."""
+    # Convert the image data to 8-bit for saving as JPEG
+    image_data_8bit = np.uint8((image_data - np.min(image_data)) / (np.max(image_data) - np.min(image_data)) * 255)
+
+    img = Image.fromarray(image_data_8bit)
+    img.save(save_path)
+    print(f"Image saved as: {save_path}")
+
+
+# Example usage
+source_dir = '/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-fits'
+output_dir = '/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs'
+
+# Process and save all images in the source directory
+process_and_save_images(source_dir, output_dir)

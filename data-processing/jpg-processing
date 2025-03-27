@@ -1,0 +1,101 @@
+import os
+import cv2
+import numpy as np
+from scipy.ndimage import zoom
+from numpy.polynomial.polynomial import polyvander2d, polyval2d
+from tqdm import tqdm
+
+def find_solar_disk(image):
+    blurred = cv2.GaussianBlur(image, (9, 9), 0)
+    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100,
+                               param1=50, param2=30, minRadius=100, maxRadius=image.shape[0] // 2)
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        x, y, r = circles[0]
+        return (x, y, r)
+    h, w = image.shape
+    return (w // 2, h // 2, min(h, w) // 2 - 10)
+
+def subtract_polynomial_background(image, mask, downscale=2, order=4):
+    img = image * mask
+    small = zoom(img, 1.0 / downscale, order=1)
+    small_mask = zoom(mask.astype(float), 1.0 / downscale, order=0)
+    ny, nx = small.shape
+    xg, yg = np.meshgrid(np.linspace(-1, 1, nx), np.linspace(-1, 1, ny))
+    rr = np.sqrt((xg - 0)**2 + (yg - 0)**2)
+    radial_mask = rr <= 0.85
+    intensity_thresh = np.percentile(small[small_mask > 0], 85)
+    fit_mask = (small < intensity_thresh) & (small_mask > 0) & radial_mask
+    x_flat = xg[fit_mask]
+    y_flat = yg[fit_mask]
+    z_flat = small[fit_mask]
+    V = polyvander2d(x_flat, y_flat, [order, order])
+    coeffs, *_ = np.linalg.lstsq(V, z_flat, rcond=None)
+    fitted_small = polyval2d(xg, yg, coeffs.reshape((order + 1, order + 1)))
+    fitted_full = zoom(fitted_small, downscale, order=1)
+    if fitted_full.shape != image.shape:
+        fitted_full = fitted_full[:image.shape[0], :image.shape[1]]
+    flat = image - fitted_full
+    flat = np.where(mask, flat, image)
+    disk_vals = flat[mask]
+    disk_norm = (disk_vals - np.min(disk_vals)) / (np.max(disk_vals) - np.min(disk_vals))
+    flat[mask] = disk_norm
+    return flat
+
+def radial_flatten(image, mask, center, radius):
+    y, x = np.indices(image.shape)
+    r = np.sqrt((x - center[0])**2 + (y - center[1])**2) / radius
+    r_masked = r[mask]
+    img_masked = image[mask]
+    r_bins = np.linspace(0, 1, 100)
+    means = []
+    for i in range(len(r_bins) - 1):
+        ring = (r_masked >= r_bins[i]) & (r_masked < r_bins[i + 1])
+        if np.sum(ring) > 10:
+            means.append(np.mean(img_masked[ring]))
+        else:
+            means.append(means[-1] if means else 1.0)
+    radial_profile = np.interp(r.flatten(), r_bins[:-1], means).reshape(image.shape)
+    flattened = image.copy()
+    flattened[mask] = image[mask] / (radial_profile[mask] + 1e-6)
+    flattened = np.clip(flattened, 0, np.percentile(flattened[mask], 99))
+    flattened[mask] = (flattened[mask] - np.min(flattened[mask])) / (np.max(flattened[mask]) - np.min(flattened[mask]))
+    return flattened
+
+def process_and_save(input_path, output_path):
+    image = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        print(f" Could not load: {input_path}")
+        return False
+
+    image_norm = image.astype(np.float32) / 255.0
+    cx, cy, radius = find_solar_disk(image)
+    h, w = image.shape
+    Y, X = np.ogrid[:h, :w]
+    disk_mask = (X - cx) ** 2 + (Y - cy) ** 2 <= radius ** 2
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_input = (image_norm * 255).astype(np.uint8)
+    clahe_applied = clahe.apply(clahe_input)
+    clahe_result = image_norm.copy()
+    clahe_result[disk_mask] = clahe_applied[disk_mask] / 255.0
+
+    bg_subtracted = subtract_polynomial_background(clahe_result, disk_mask)
+    final_image = radial_flatten(bg_subtracted, disk_mask, (cx, cy), radius)
+
+    final_uint8 = (final_image * 255).astype(np.uint8)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cv2.imwrite(output_path, final_uint8)
+    return True
+
+def process_directory(input_dir, output_dir):
+    count = 0
+    for root, _, files in os.walk(input_dir):
+        for file in tqdm(files, desc="Processing images"):
+            if file.lower().endswith(".jpg"):
+                input_path = os.path.join(root, file)
+                relative_path = os.path.relpath(input_path, input_dir)
+                output_path = os.path.join(output_dir, relative_path)
+                if process_and_save(input_path, output_path):
+                    count += 1
+    print(f"\n Done! {count} image(s) processed and saved to '{output_dir}'")

@@ -1,0 +1,59 @@
+import os
+import numpy as np
+from astropy.io import fits
+from sunpy.map import Map
+from PIL import Image
+
+def get_data(fits_file):
+    """Load raw FITS data without any processing."""
+    s_map = Map(fits_file)
+    return s_map.data
+
+def save_image_as_jpg(image_data, save_path):
+    """Convert raw FITS image data to 8-bit JPG."""
+    if np.max(image_data) == np.min(image_data):
+        print(f"Skipped {save_path} — image has no contrast.")
+        return
+
+    # Normalize and convert to 8-bit
+    norm_data = (image_data - np.min(image_data)) / (np.max(image_data) - np.min(image_data))
+    image_data_8bit = np.uint8(norm_data * 255)
+    
+    img = Image.fromarray(image_data_8bit)
+    img.save(save_path)
+    print(f"Saved: {save_path}")
+
+def process_and_save_images(source_dir, output_dir):
+    """Recursively convert all FITS files to JPG, preserving folder structure."""
+    for root, dirs, files in os.walk(source_dir):
+        for file in files:
+            if file.endswith((".fits", ".fits.fz", ".FITS")):
+                fits_file_path = os.path.join(root, file)
+                print(f"Processing: {fits_file_path}")
+
+                # Load FITS data
+                try:
+                    image_data = get_data(fits_file_path)
+                except Exception as e:
+                    print(f"Failed to load {fits_file_path}: {e}")
+                    continue
+
+                # Reconstruct output path with same subfolder structure
+                relative_path = os.path.relpath(fits_file_path, source_dir)
+                import re
+
+                # Remove any .fits, .fits.fz, .FITS, etc. from the end and replace with .jpg
+                relative_jpg_path = re.sub(r'\.fits(\.fz)?$', '', relative_path, flags=re.IGNORECASE) + ".jpg"
+
+                output_path = os.path.join(output_dir, relative_jpg_path)
+
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+                # Save image
+                save_image_as_jpg(image_data, output_path)
+
+# Example usage (adjust these as needed)
+source_dir = '/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-fits'
+output_dir = '/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-jpgs'
+
+process_and_save_images(source_dir, output_dir)

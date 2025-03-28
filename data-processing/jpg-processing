@@ -1,9 +1,15 @@
 import os
 import cv2
 import numpy as np
-from scipy.ndimage import zoom
-from numpy.polynomial.polynomial import polyvander2d, polyval2d
+from pathlib import Path
 from tqdm import tqdm
+from matplotlib import pyplot as plt
+from scipy.ndimage import zoom, gaussian_filter1d
+from numpy.polynomial.polynomial import polyvander2d, polyval2d
+from skimage.morphology import remove_small_objects
+import imageio.v2 as imageio
+
+# === Preprocessing Functions (unchanged) ===
 
 def find_solar_disk(image):
     blurred = cv2.GaussianBlur(image, (9, 9), 0)
@@ -22,7 +28,7 @@ def subtract_polynomial_background(image, mask, downscale=2, order=4):
     small_mask = zoom(mask.astype(float), 1.0 / downscale, order=0)
     ny, nx = small.shape
     xg, yg = np.meshgrid(np.linspace(-1, 1, nx), np.linspace(-1, 1, ny))
-    rr = np.sqrt((xg - 0)**2 + (yg - 0)**2)
+    rr = np.sqrt(xg**2 + yg**2)
     radial_mask = rr <= 0.85
     intensity_thresh = np.percentile(small[small_mask > 0], 85)
     fit_mask = (small < intensity_thresh) & (small_mask > 0) & radial_mask
@@ -42,60 +48,105 @@ def subtract_polynomial_background(image, mask, downscale=2, order=4):
     flat[mask] = disk_norm
     return flat
 
-def radial_flatten(image, mask, center, radius):
+def radial_flatten(image, mask, center, radius, limb_clip=0.9):
     y, x = np.indices(image.shape)
-    r = np.sqrt((x - center[0])**2 + (y - center[1])**2) / radius
-    r_masked = r[mask]
+    r = np.sqrt((x - center[0])**2 + (y - center[1])**2)
+    r_norm = r / radius
+    r_masked = r_norm[mask]
     img_masked = image[mask]
-    r_bins = np.linspace(0, 1, 100)
+    r_bins = np.linspace(0, limb_clip, 100)
     means = []
     for i in range(len(r_bins) - 1):
         ring = (r_masked >= r_bins[i]) & (r_masked < r_bins[i + 1])
-        if np.sum(ring) > 10:
-            means.append(np.mean(img_masked[ring]))
-        else:
-            means.append(means[-1] if means else 1.0)
-    radial_profile = np.interp(r.flatten(), r_bins[:-1], means).reshape(image.shape)
-    flattened = image.copy()
+        means.append(np.mean(img_masked[ring]) if np.sum(ring) > 10 else (means[-1] if means else 1.0))
+    means = gaussian_filter1d(means, sigma=2)
+    profile_interp = np.interp(r_norm.flatten(), r_bins[:-1], means, left=means[0], right=means[-1])
+    radial_profile = profile_interp.reshape(image.shape)
+    min_val = np.percentile(radial_profile[mask], 5)
+    radial_profile = np.clip(radial_profile, min_val, None)
+    flattened = np.copy(image)
     flattened[mask] = image[mask] / (radial_profile[mask] + 1e-6)
     flattened = np.clip(flattened, 0, np.percentile(flattened[mask], 99))
     flattened[mask] = (flattened[mask] - np.min(flattened[mask])) / (np.max(flattened[mask]) - np.min(flattened[mask]))
     return flattened
 
-def process_and_save(input_path, output_path):
-    image = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        print(f" Could not load: {input_path}")
-        return False
+def suppress_dark_speckle_noise(image, mask, min_size=10):
+    inverted = 1.0 - image
+    binary = (inverted > 0.15) & mask
+    cleaned = remove_small_objects(binary, min_size=min_size)
+    blurred_mask = gaussian_filter1d(cleaned.astype(np.float32), sigma=1, axis=0)
+    blurred_mask = gaussian_filter1d(blurred_mask, sigma=1, axis=1)
+    smoothed = cv2.GaussianBlur(image, (5, 5), 0)
+    denoised = image * (1 - blurred_mask) + smoothed * blurred_mask
+    return np.clip(denoised, 0, 1)
 
+def enhance_contrast_preserve_filaments(image, mask, background_level=0.9):
+    result = np.zeros_like(image)
+    result[mask] = image[mask]
+    disk_vals = result[mask]
+    low, high = np.percentile(disk_vals, [2, 98])
+    stretched = (disk_vals - low) / (high - low + 1e-6)
+    stretched = np.clip(stretched, 0, 1)
+    final_vals = stretched ** 0.7
+    final_vals = background_level * final_vals + (1 - background_level) * (1 - final_vals)
+    result[mask] = final_vals
+    return np.clip(result, 0, 1)
+
+def match_limb_to_disk_background(image, center, radius, mask, blend_width_ratio=0.06):
+    y, x = np.indices(image.shape)
+    r = np.sqrt((x - center[0])**2 + (y - center[1])**2)
+    dist_from_edge = radius - r
+    blend_width = radius * blend_width_ratio
+    blend_mask = np.clip(1 - (dist_from_edge / blend_width), 0, 1)
+    blend_mask = blend_mask * mask
+    inner_mask = (r < radius * 0.85) & mask
+    background_val = np.median(image[inner_mask])
+    blended = image * (1 - blend_mask) + background_val * blend_mask
+    return np.clip(blended, 0, 1)
+
+# === Image Processing and Saving ===
+
+def process_image(image_path, output_path):
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return False
     image_norm = image.astype(np.float32) / 255.0
     cx, cy, radius = find_solar_disk(image)
     h, w = image.shape
     Y, X = np.ogrid[:h, :w]
     disk_mask = (X - cx) ** 2 + (Y - cy) ** 2 <= radius ** 2
+    image_disk = image_norm.copy()
+    bg_subtracted = subtract_polynomial_background(image_disk, disk_mask.astype(bool))
+    flattened_image = radial_flatten(bg_subtracted, disk_mask, (cx, cy), radius)
+    denoised_image = suppress_dark_speckle_noise(flattened_image, disk_mask)
+    final_image = enhance_contrast_preserve_filaments(denoised_image, disk_mask)
+    final_image = match_limb_to_disk_background(final_image, (cx, cy), radius, disk_mask)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    clahe_input = (image_norm * 255).astype(np.uint8)
-    clahe_applied = clahe.apply(clahe_input)
-    clahe_result = image_norm.copy()
-    clahe_result[disk_mask] = clahe_applied[disk_mask] / 255.0
-
-    bg_subtracted = subtract_polynomial_background(clahe_result, disk_mask)
-    final_image = radial_flatten(bg_subtracted, disk_mask, (cx, cy), radius)
-
-    final_uint8 = (final_image * 255).astype(np.uint8)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cv2.imwrite(output_path, final_uint8)
+    output_image = (final_image * 255).astype(np.uint8)
+    os.makedirs(output_path.parent, exist_ok=True)
+    imageio.imwrite(str(output_path), output_image)
     return True
 
-def process_directory(input_dir, output_dir):
-    count = 0
-    for root, _, files in os.walk(input_dir):
-        for file in tqdm(files, desc="Processing images"):
-            if file.lower().endswith(".jpg"):
-                input_path = os.path.join(root, file)
-                relative_path = os.path.relpath(input_path, input_dir)
-                output_path = os.path.join(output_dir, relative_path)
-                if process_and_save(input_path, output_path):
-                    count += 1
-    print(f"\n Done! {count} image(s) processed and saved to '{output_dir}'")
+# === Recursive Batch Processing ===
+
+def batch_process(input_root, output_root):
+    input_root = Path(input_root)
+    output_root = Path(output_root)
+    image_extensions = ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']
+    all_images = [p for p in input_root.rglob("*") if p.suffix.lower() in image_extensions]
+
+    processed_count = 0  # Counter for successfully processed images
+
+    for image_path in tqdm(all_images, desc="Processing images"):
+        relative_path = image_path.relative_to(input_root)
+        output_path = output_root / relative_path.with_suffix(".png")  # save as .png
+        success = process_image(image_path, output_path)
+        if success:
+            processed_count += 1
+
+    print(f"\n Total images processed and saved: {processed_count} out of {len(all_images)}")
+
+batch_process(
+    "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-jpgs",
+    "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs"
+)

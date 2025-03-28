@@ -1,16 +1,19 @@
 import os
 import numpy as np
 from astropy.io import fits
-from sunpy.map import Map
 from PIL import Image
+import re
 
 def get_data(fits_file):
-    """Load raw FITS data without any processing."""
-    s_map = Map(fits_file)
-    return s_map.data
+    """Load image data from the correct HDU (usually [1] for COMPRESSED_IMAGE)."""
+    with fits.open(fits_file) as hdul:
+        for hdu in hdul:
+            if hdu.data is not None:
+                return hdu.data
+        raise ValueError("No image data found in any HDU.")
 
 def save_image_as_jpg(image_data, save_path):
-    """Convert raw FITS image data to 8-bit JPG."""
+    """Convert raw FITS image data to 8-bit JPG with correct orientation."""
     if np.max(image_data) == np.min(image_data):
         print(f"Skipped {save_path} — image has no contrast.")
         return
@@ -18,7 +21,10 @@ def save_image_as_jpg(image_data, save_path):
     # Normalize and convert to 8-bit
     norm_data = (image_data - np.min(image_data)) / (np.max(image_data) - np.min(image_data))
     image_data_8bit = np.uint8(norm_data * 255)
-    
+
+    # Flip vertically to match matplotlib imshow(origin='lower') view
+    image_data_8bit = np.flipud(image_data_8bit)
+
     img = Image.fromarray(image_data_8bit)
     img.save(save_path)
     print(f"Saved: {save_path}")
@@ -38,21 +44,16 @@ def process_and_save_images(source_dir, output_dir):
                     print(f"Failed to load {fits_file_path}: {e}")
                     continue
 
-                # Reconstruct output path with same subfolder structure
+                # Construct output path
                 relative_path = os.path.relpath(fits_file_path, source_dir)
-                import re
-
-                # Remove any .fits, .fits.fz, .FITS, etc. from the end and replace with .jpg
                 relative_jpg_path = re.sub(r'\.fits(\.fz)?$', '', relative_path, flags=re.IGNORECASE) + ".jpg"
-
                 output_path = os.path.join(output_dir, relative_jpg_path)
-
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
                 # Save image
                 save_image_as_jpg(image_data, output_path)
 
-# Example usage (adjust these as needed)
+# Example usage (adjust as needed)
 source_dir = '/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-fits'
 output_dir = '/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-jpgs'
 

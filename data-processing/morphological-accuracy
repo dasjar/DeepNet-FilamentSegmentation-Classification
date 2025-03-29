@@ -1,0 +1,106 @@
+import os
+import cv2
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from skimage.draw import polygon
+
+def polygon_to_mask(image_shape, annotations, image_id):
+    mask = np.zeros(image_shape, dtype=np.uint8)
+    for ann in annotations:
+        if str(ann["image_id"]) == str(image_id):
+            if isinstance(ann["segmentation"], list):
+                for seg in ann["segmentation"]:
+                    if len(seg) >= 6:
+                        points = np.array(seg).reshape(-1, 2)
+                        rr, cc = polygon(points[:, 1], points[:, 0], shape=image_shape)
+                        mask[rr, cc] = 1
+    return mask
+
+def iou_score(pred_mask, gt_mask):
+    pred = (pred_mask > 0).astype(np.uint8)
+    gt = (gt_mask > 0).astype(np.uint8)
+    intersection = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    return intersection / union if union > 0 else 0.0
+
+def evaluate_all_masks(pred_dir, coco_json_path, iou_threshold=0.3):
+    with open(coco_json_path, "r") as f:
+        coco_data = json.load(f)
+
+    image_id_lookup = {
+        str(img["id"]): (img["height"], img["width"])
+        for img in coco_data["images"]
+    }
+
+    annotated_image_ids = {str(ann["image_id"]) for ann in coco_data["annotations"]}
+    results = []
+
+    for root, _, files in os.walk(pred_dir):
+        for file in files:
+            if file.endswith(".jpg"):
+                pred_path = os.path.join(root, file)
+                pred_mask = cv2.imread(pred_path, cv2.IMREAD_GRAYSCALE)
+                if pred_mask is None:
+                    continue
+
+                image_id = Path(file).stem
+                if image_id not in image_id_lookup or image_id not in annotated_image_ids:
+                    continue
+
+                gt_shape = image_id_lookup[image_id]
+                gt_mask = polygon_to_mask(gt_shape, coco_data["annotations"], image_id)
+                if not np.any(gt_mask):
+                    continue
+
+                iou = iou_score(pred_mask, gt_mask)
+                correct = int(iou >= iou_threshold)
+
+                results.append({
+                    "image_id": image_id,
+                    "iou": iou,
+                    "TP": int(correct),
+                    "FP": int(not correct),
+                    "FN": int(not correct),
+                })
+
+    return pd.DataFrame(results)
+
+# === CONFIGURATION ===
+pred_mask_folder = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/morph-masks"
+coco_json_path = "/content/drive/MyDrive/filament-detection-project/data/magfilo_2024_v1.0.json"
+
+# === RUN EVALUATION ===
+df = evaluate_all_masks(pred_mask_folder, coco_json_path)
+
+# === METRICS ===
+df["Precision"] = df["TP"] / (df["TP"] + df["FP"])
+df["Recall"] = df["TP"] / (df["TP"] + df["FN"])
+df["F1"] = 2 * df["Precision"] * df["Recall"] / (df["Precision"] + df["Recall"])
+df["Accuracy"] = df["TP"]
+df.fillna(0, inplace=True)
+
+# === SMOOTHING FOR CLEAN CURVES ===
+window = 10
+df["Precision_smooth"] = df["Precision"].rolling(window, min_periods=1).mean()
+df["Recall_smooth"] = df["Recall"].rolling(window, min_periods=1).mean()
+df["F1_smooth"] = df["F1"].rolling(window, min_periods=1).mean()
+df["Accuracy_smooth"] = df["Accuracy"].rolling(window, min_periods=1).mean()
+
+# === PLOT ===
+plt.figure(figsize=(12, 6))
+plt.plot(df["Precision_smooth"], label="Precision", linewidth=2)
+plt.plot(df["Recall_smooth"], label="Recall", linewidth=2)
+plt.plot(df["F1_smooth"], label="F1 Score", linewidth=2)
+plt.plot(df["Accuracy_smooth"], label="Accuracy", linewidth=2)
+
+plt.xlabel("Image Index")
+plt.ylabel("Smoothed Metric Value")
+plt.title("Segmentation Evaluation (IoU ≥ 0.5, Rolling Avg Window = 10)")
+plt.ylim(0, 1.05)
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.show()

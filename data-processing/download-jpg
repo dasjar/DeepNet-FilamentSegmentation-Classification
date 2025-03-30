@@ -1,0 +1,83 @@
+import os, re
+import json
+import requests
+from tqdm import tqdm
+
+# === Paths ===
+annotations_path = "/content/drive/MyDrive/filament-detection-project/data/magfilo_2024_v1.0.json"
+download_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-jpgs"
+
+# === Load annotation file
+with open(annotations_path, "r") as f:
+    coco = json.load(f)
+
+# === Get annotated image_ids
+annotated_ids = {str(ann["image_id"]) for ann in coco["annotations"]}
+
+# === Group: file_name → list of matching image_ids
+file_to_ids = {}
+file_lookup = {}
+
+for img in coco["images"]:
+    img_id = str(img["id"])
+    file_name = img["file_name"].replace(".jpeg", ".jpg")
+    if img_id in annotated_ids:
+        file_to_ids.setdefault(file_name, []).append(img_id)
+        file_lookup[file_name] = img["file_name"]
+
+print(f"Found {len(file_to_ids)} unique image filenames with annotations.")
+
+# === Utilities
+def extract_date(filename):
+    match = re.search(r"(20\d{2})(\d{2})(\d{2})", filename)
+    return match.groups() if match else (None, None, None)
+
+def download_image(url, save_path):
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            total = int(response.headers.get("content-length", 0))
+            with open(save_path, "wb") as f, tqdm(
+                total=total, unit="B", unit_scale=True, desc=os.path.basename(save_path), leave=False
+            ) as bar:
+                for chunk in response.iter_content(8192):
+                    f.write(chunk)
+                    bar.update(len(chunk))
+            return True
+        else:
+            print(f"Failed to download (status {response.status_code}): {url}")
+            return False
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+# === Download and save for each file_name
+print("\nDownloading annotated images...\n")
+total_saved = 0
+
+for file_name, id_list in file_to_ids.items():
+    year, month, day = extract_date(file_name)
+    if not year:
+        print(f"Skipping {file_name} — invalid date")
+        continue
+
+    url = f"https://gong2.nso.edu/HA/hag/{year}{month}/{year}{month}{day}/{file_name}"
+    temp_path = os.path.join(download_dir, "temp.jpg")
+
+    # Download once
+    if not download_image(url, temp_path):
+        continue
+
+    # Save under each image ID
+    for img_id in id_list:
+        save_dir = os.path.join(download_dir, year, month, day)
+        os.makedirs(save_dir, exist_ok=True)
+        final_path = os.path.join(save_dir, f"{img_id}.jpg")
+
+        with open(temp_path, "rb") as src, open(final_path, "wb") as dst:
+            dst.write(src.read())
+        total_saved += 1
+
+    os.remove(temp_path)
+
+print(f"\nDownload complete. Total annotated JPGs saved: {total_saved}")

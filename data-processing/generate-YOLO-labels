@@ -1,126 +1,103 @@
 import json
 import os
-import glob
-import numpy as np
 from PIL import Image
+from pathlib import Path
 
 # Paths
 annotations_path = "/content/drive/MyDrive/filament-detection-project/data/magfilo_2024_v1.0.json"
-images_folder = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs"
+images_folder = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs-having-annotations"
 output_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/labels"
 
-# Ensure the labels directory exists before writing
 os.makedirs(output_dir, exist_ok=True)
 
-# Load COCO JSON safely with error handling
-try:
-    with open(annotations_path, "r", encoding="utf-8") as f:
-        coco_data = json.load(f)
-    print("JSON loaded successfully!")
-except json.JSONDecodeError as e:
-    print(f"JSON Error: {e}")
-    exit()
+# Load COCO JSON
+with open(annotations_path, "r", encoding="utf-8") as f:
+    coco_data = json.load(f)
 
-# Ensure expected keys exist
+# Validate keys
 if "images" not in coco_data or "annotations" not in coco_data or "categories" not in coco_data:
-    print("Error: JSON file is missing required keys ('images', 'annotations', or 'categories').")
+    print("JSON file missing required keys: 'images', 'annotations', or 'categories'")
     exit()
 
-# Create a dictionary mapping image 'id' to file_name and dimensions
-image_info = {img["id"]: (img["file_name"], img["height"], img["width"]) for img in coco_data["images"]}
+# Build category_id → YOLO class index map
+category_id_to_class_idx = {
+    cat["id"]: idx
+    for idx, cat in enumerate(sorted(coco_data["categories"], key=lambda c: c["id"]))
+}
 
-# Create a dictionary to map category id to category name
-category_info = {category["id"]: category["name"] for category in coco_data["categories"]}
+# Map image_id → metadata
+image_info = {
+    str(img["id"]): {
+        "file_name": img["file_name"],
+        "height": img["height"],
+        "width": img["width"]
+    }
+    for img in coco_data["images"]
+}
 
-# Group annotations by image 'id' (the 'id' in 'images' list)
-annotations_by_image_id = {}
-for annotation in coco_data["annotations"]:
-    image_id = annotation["image_id"]
-
-    # Find the corresponding image 'id' from the image_info dictionary
-    for img_id, (file_name, img_height, img_width) in image_info.items():
-        if img_id == image_id:
-            if img_id not in annotations_by_image_id:
-                annotations_by_image_id[img_id] = {
-                    "file_name": file_name,
-                    "annotations": [],
-                    "height": img_height,
-                    "width": img_width
-                }
-            annotations_by_image_id[img_id]["annotations"].append(annotation)
-            break
+# Group annotations by image_id
+annotations_by_id = {}
+for ann in coco_data["annotations"]:
+    image_id = str(ann["image_id"])
+    annotations_by_id.setdefault(image_id, []).append(ann)
 
 # Get all image paths
 def get_all_images(image_dir):
-    """ Recursively find all images in `image_dir` and return their full paths. """
     image_paths = []
     for root, _, files in os.walk(image_dir):
         for file in files:
-            if file.endswith((".jpg", ".jpeg", ".png")):
+            if file.lower().endswith((".jpg", ".jpeg")):
                 image_paths.append(os.path.join(root, file))
-    print(f"\nTotal images found: {len(image_paths)} in {image_dir}\n")
     return image_paths
 
-# Get all image paths
 image_paths = get_all_images(images_folder)
 
-# Track number of labels generated
+# Generate YOLO label files
 num_labels_generated = 0
-processed_images = set()
 
-# Process each image and create YOLO labels
 for image_path in image_paths:
-    file_name = os.path.basename(image_path)
+    stem = Path(image_path).stem
 
-    # Skip already processed images
-    if file_name in processed_images:
+    if stem not in image_info:
+        print(f"Image ID not found in JSON: {stem}")
         continue
 
-    # Get the image_id from the file name (remove the ".jpg" part)
-    image_id = file_name.split('.')[0]
-
-    # Get corresponding annotations (if any)
-    if image_id not in annotations_by_image_id:
-        print(f"Skipping image with no matching annotations: {file_name}")
+    if stem not in annotations_by_id:
+        print(f"Skipping (no annotations): {stem}")
         continue
 
-    annotations = annotations_by_image_id[image_id]["annotations"]
+    label_file_path = os.path.join(output_dir, f"{stem}.txt")
+    if os.path.exists(label_file_path):
+        print(f"Skipping (already exists): {stem}.txt")
+        continue
 
-    # Get actual image dimensions
-    original_image = Image.open(image_path)
-    img_width, img_height = original_image.size  # Use actual image size
+    annotations = annotations_by_id[stem]
 
-    print(f"Processing {file_name} (Width: {img_width}, Height: {img_height}) with {len(annotations)} annotations")
+    try:
+        with Image.open(image_path) as img:
+            img_width, img_height = img.size
+    except Exception as e:
+        print(f"Error opening image {stem}: {e}")
+        continue
 
-    # Ensure the output label directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Define the output .txt file path
-    label_file_path = os.path.join(output_dir, f"{os.path.splitext(file_name)[0]}.txt")
-
-    # Convert COCO bounding boxes to YOLO format and save labels
     with open(label_file_path, "w") as label_file:
-        for annotation in annotations:
-            # Extract COCO bbox (x_min, y_min, width, height) in pixel units
-            x_min, y_min, box_width, box_height = annotation["bbox"]
+        for ann in annotations:
+            x_min, y_min, box_width, box_height = ann["bbox"]
 
-            # Convert to YOLO format (normalized values)
-            x_center = (x_min + box_width / 2) / img_width  # Normalize by image width
-            y_center = (y_min + box_height / 2) / img_height  # Normalize by image height
-            norm_width = box_width / img_width  # Normalize width
-            norm_height = box_height / img_height  # Normalize height
+            x_center = (x_min + box_width / 2) / img_width
+            y_center = (y_min + box_height / 2) / img_height
+            norm_width = box_width / img_width
+            norm_height = box_height / img_height
 
-            # Get the category name from the category_info dictionary
-            category_name = category_info.get(annotation["category_id"], "Unknown")
-            # Map category name to a class ID
-            class_id = {"Left": 0, "Right": 1, "Unidentifiable": 2, "Ambiguous": 3}.get(category_name, -1)
+            class_id = category_id_to_class_idx.get(ann["category_id"], -1)
+            if class_id == -1:
+                print(f"Unknown category_id: {ann['category_id']} in {stem}")
+                continue
 
-            # Only write if the class ID is valid (i.e., not -1)
-            if class_id != -1:
-                label_file.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
+            label_file.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
 
-        num_labels_generated += 1
-        processed_images.add(file_name)  # Mark image as processed
+    num_labels_generated += 1
+    print(f"Processed: {stem} ({len(annotations)} annotations)")
 
-print(f"\nTotal labels generated: {num_labels_generated}")
-print(f"All YOLO labels saved in: {output_dir}")
+print(f"\nTotal YOLO label files created: {num_labels_generated}")
+print(f"Labels saved in: {output_dir}")

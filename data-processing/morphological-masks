@@ -1,135 +1,108 @@
 import os
 import cv2
-import numpy as np
 import json
+import numpy as np
 from pathlib import Path
-from skimage.draw import polygon
-from skimage.morphology import (binary_opening, rectangle)
+from skimage.morphology import binary_opening, rectangle, remove_small_objects
 from skimage.measure import label, regionprops
+from multiprocessing import Pool, cpu_count
 
-def process_image(image_path, coco_data):
+# Thresholds and parameters
+PIXEL_INTENSITY_THRESHOLD = 100
+FILAMENT_MIN_AREA = 450
+REMOVE_SMALL_DOTS_AREA = 100  # Remove tiny connected noise before processing
+
+# Eight linear structuring elements (15x15 approximations)
+directions = [
+    rectangle(1, 15), rectangle(15, 1),
+    np.eye(15, dtype=bool),
+    np.flip(np.eye(15, dtype=bool), axis=1),
+    rectangle(3, 15), rectangle(15, 3),
+    np.pad(np.eye(7, dtype=bool), ((4, 4), (4, 4))),
+    np.pad(np.flip(np.eye(7, dtype=bool), axis=1), ((4, 4), (4, 4)))
+]
+
+def process_image(args):
+    image_path, output_path, coco_data = args
+
+    if os.path.exists(output_path):
+        print(f"Skipping (already exists): {Path(image_path).name}")
+        return
+
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         print(f"Could not load image: {image_path}")
-        return None
+        return
 
-    image_id = Path(image_path).stem
-    image_height, image_width = image.shape
-    standardized = image.astype(np.uint8)
+    h, w = image.shape
+    binary_mask = image < PIXEL_INTENSITY_THRESHOLD
 
-    # === COCO annotation (for matching image_id only) ===
-    gt_mask = np.zeros((image_height, image_width), dtype=np.uint8)
-    for ann in coco_data["annotations"]:
-        if str(ann["image_id"]) == image_id:
-            if isinstance(ann["segmentation"], list):
-                for seg in ann["segmentation"]:
-                    points = np.array(seg).reshape(-1, 2)
-                    rr, cc = polygon(points[:, 1], points[:, 0], (image_height, image_width))
-                    gt_mask[rr, cc] = 255
+    # Remove small noisy blobs before further processing
+    cleaned_mask = remove_small_objects(binary_mask, min_size=REMOVE_SMALL_DOTS_AREA)
 
-    # === Sunspot removal ===
-    spot_seed_mask = standardized < 30
-    spot_grown = spot_seed_mask.copy()
-    queue = list(zip(*np.where(spot_seed_mask)))
+    if not np.any(cleaned_mask):
+        print(f"[{Path(image_path).name}] No pixels below threshold.")
+        return
 
-    while queue:
-        y, x = queue.pop()
-        for dy in [-1, 0, 1]:
-            for dx in [-1, 0, 1]:
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < image_height and 0 <= nx < image_width:
-                    if not spot_grown[ny, nx] and standardized[ny, nx] < 100:
-                        spot_grown[ny, nx] = True
-                        queue.append((ny, nx))
-
-    labeled_spots = label(spot_grown)
-    for region in regionprops(labeled_spots):
-        if region.area > 2000:
-            for y, x in region.coords:
-                spot_grown[y, x] = 0
-
-    standardized[spot_grown] = 255
-
-    # === Filament seed detection (threshold < 100) ===
-    filament_mask = standardized < 100
-
-    directions = [
-        rectangle(1, 9), rectangle(9, 1),
-        np.eye(9, dtype=bool),
-        np.flip(np.eye(9, dtype=bool), axis=1),
-        rectangle(3, 9), rectangle(9, 3),
-        np.pad(np.eye(5, dtype=bool), ((2, 2), (2, 2))),
-        np.pad(np.flip(np.eye(5, dtype=bool), axis=1), ((2, 2), (2, 2)))
-    ]
-
-    survival_mask = np.zeros_like(filament_mask, dtype=np.uint8)
+    # Morphological filtering
+    survival_mask = np.zeros_like(cleaned_mask, dtype=np.uint8)
     for selem in directions:
-        opened = binary_opening(filament_mask, selem)
+        opened = binary_opening(cleaned_mask, selem)
         survival_mask += opened.astype(np.uint8)
 
     filament_seeds = survival_mask >= 2
+    if not np.any(filament_seeds):
+        print(f"[{Path(image_path).name}] No filament seeds found.")
+        return
 
-    # === Region growing until pixel > 160 ===
-    grown_filaments = filament_seeds.copy()
+    # Region growing
+    grown = filament_seeds.copy()
     queue = list(zip(*np.where(filament_seeds)))
-
     while queue:
         y, x = queue.pop()
         for dy in [-1, 0, 1]:
             for dx in [-1, 0, 1]:
                 ny, nx = y + dy, x + dx
-                if 0 <= ny < image_height and 0 <= nx < image_width:
-                    if not grown_filaments[ny, nx] and standardized[ny, nx] < 160:
-                        grown_filaments[ny, nx] = True
+                if 0 <= ny < h and 0 <= nx < w:
+                    if not grown[ny, nx] and image[ny, nx] < PIXEL_INTENSITY_THRESHOLD:
+                        grown[ny, nx] = True
                         queue.append((ny, nx))
 
-    # === Final filtering: shape + size ===
-    labeled = label(grown_filaments)
-    filtered = np.zeros_like(grown_filaments, dtype=np.uint8)
+    # Area + eccentricity filtering
+    labeled = label(grown)
+    final_mask = np.zeros_like(grown, dtype=np.uint8)
+    retained = 0
     for region in regionprops(labeled):
-        if region.area >= 300 and region.eccentricity > 0.8:
-            filtered[labeled == region.label] = 255
+        if region.area >= FILAMENT_MIN_AREA and region.eccentricity > 0.5:
+            final_mask[labeled == region.label] = 1
+            retained += 1
 
-    return filtered
+    if retained == 0:
+        print(f"[{Path(image_path).name}] No regions passed filters.")
+        return
 
-def count_output_files(output_dir):
-    total = 0
-    for root, _, files in os.walk(output_dir):
-        for file in files:
-            if file.endswith(".jpg"):
-                total += 1
-    return total
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cv2.imwrite(output_path, final_mask * 255)  # write binary mask as visible PNG
+    print(f"[{Path(image_path).name}] Retained {retained} filament regions. Saved mask.")
 
 def process_directory(input_dir, output_dir, coco_json_path):
     with open(coco_json_path, "r") as f:
         coco_data = json.load(f)
 
-    processed_count = 0
-
+    tasks = []
     for root, _, files in os.walk(input_dir):
         for file in files:
             if file.endswith(".jpg"):
                 full_input_path = os.path.join(root, file)
                 relative_path = os.path.relpath(full_input_path, input_dir)
-                output_path = os.path.join(output_dir, relative_path)
+                output_path = os.path.join(output_dir, os.path.splitext(relative_path)[0] + ".png")
+                tasks.append((full_input_path, output_path, coco_data))
 
-                if os.path.exists(output_path):
-                    print(f"Skipping (exists): {relative_path}")
-                    continue
+    print(f"Starting multiprocessing with {cpu_count()} cores...")
+    with Pool() as pool:
+        pool.map(process_image, tasks)
 
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-                mask = process_image(full_input_path, coco_data)
-                if mask is not None:
-                    cv2.imwrite(output_path, mask)
-                    print(f"Saved: {relative_path}")
-                    processed_count += 1
-
-    print(f"\nTotal files processed and saved in this run: {processed_count}")
-    total_output_files = count_output_files(output_dir)
-    print(f"Total mask files in output directory (all .jpg): {total_output_files}")
-
-# === Example usage ===
+# Example usage
 input_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs"
 output_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/morph-masks"
 coco_json_path = "/content/drive/MyDrive/filament-detection-project/data/magfilo_2024_v1.0.json"

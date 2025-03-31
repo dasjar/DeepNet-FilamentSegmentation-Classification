@@ -1,0 +1,103 @@
+import json
+import os
+from PIL import Image
+from pathlib import Path
+
+# Paths
+annotations_path = "/content/drive/MyDrive/filament-detection-project/data/magfilo_2024_v1.0.json"
+images_folder = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs"
+output_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/labels"
+
+os.makedirs(output_dir, exist_ok=True)
+
+# Load COCO JSON
+with open(annotations_path, "r", encoding="utf-8") as f:
+    coco_data = json.load(f)
+
+# Validate keys
+if "images" not in coco_data or "annotations" not in coco_data or "categories" not in coco_data:
+    print("JSON file missing required keys: 'images', 'annotations', or 'categories'")
+    exit()
+
+# Build category_id → YOLO class index map
+category_id_to_class_idx = {
+    cat["id"]: idx
+    for idx, cat in enumerate(sorted(coco_data["categories"], key=lambda c: c["id"]))
+}
+
+# Map image_id → metadata
+image_info = {
+    str(img["id"]): {
+        "file_name": img["file_name"],
+        "height": img["height"],
+        "width": img["width"]
+    }
+    for img in coco_data["images"]
+}
+
+# Group annotations by image_id
+annotations_by_id = {}
+for ann in coco_data["annotations"]:
+    image_id = str(ann["image_id"])
+    annotations_by_id.setdefault(image_id, []).append(ann)
+
+# Get all image paths
+def get_all_images(image_dir):
+    image_paths = []
+    for root, _, files in os.walk(image_dir):
+        for file in files:
+            if file.lower().endswith((".jpg", ".jpeg")):
+                image_paths.append(os.path.join(root, file))
+    return image_paths
+
+image_paths = get_all_images(images_folder)
+
+# Generate YOLO label files
+num_labels_generated = 0
+
+for image_path in image_paths:
+    stem = Path(image_path).stem
+
+    if stem not in image_info:
+        print(f"Image ID not found in JSON: {stem}")
+        continue
+
+    if stem not in annotations_by_id:
+        print(f"Skipping (no annotations): {stem}")
+        continue
+
+    label_file_path = os.path.join(output_dir, f"{stem}.txt")
+    if os.path.exists(label_file_path):
+        print(f"Skipping (already exists): {stem}.txt")
+        continue
+
+    annotations = annotations_by_id[stem]
+
+    try:
+        with Image.open(image_path) as img:
+            img_width, img_height = img.size
+    except Exception as e:
+        print(f"Error opening image {stem}: {e}")
+        continue
+
+    with open(label_file_path, "w") as label_file:
+        for ann in annotations:
+            x_min, y_min, box_width, box_height = ann["bbox"]
+
+            x_center = (x_min + box_width / 2) / img_width
+            y_center = (y_min + box_height / 2) / img_height
+            norm_width = box_width / img_width
+            norm_height = box_height / img_height
+
+            class_id = category_id_to_class_idx.get(ann["category_id"], -1)
+            if class_id == -1:
+                print(f"Unknown category_id: {ann['category_id']} in {stem}")
+                continue
+
+            label_file.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
+
+    num_labels_generated += 1
+    print(f"Processed: {stem} ({len(annotations)} annotations)")
+
+print(f"\nTotal YOLO label files created: {num_labels_generated}")
+print(f"Labels saved in: {output_dir}")

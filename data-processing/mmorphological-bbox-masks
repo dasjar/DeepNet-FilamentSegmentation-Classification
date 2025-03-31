@@ -6,7 +6,7 @@ from skimage.measure import label, regionprops
 
 # === Paths ===
 mask_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/morph-masks"
-bbox_output_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/bbox-masks"
+bbox_output_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/morph-bbox-masks"
 os.makedirs(bbox_output_dir, exist_ok=True)
 
 # === Padding (in pixels) ===

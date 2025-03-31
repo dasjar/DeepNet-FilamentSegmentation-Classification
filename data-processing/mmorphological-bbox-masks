@@ -1,1 +1,61 @@
+import os
+import cv2
+import numpy as np
+from pathlib import Path
+from skimage.measure import label, regionprops
 
+# === Paths ===
+mask_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/morph-masks"
+bbox_output_dir = "/content/drive/MyDrive/filament-detection-project/data/YOLO-data/bbox-masks"
+os.makedirs(bbox_output_dir, exist_ok=True)
+
+# === Padding (in pixels) ===
+PADDING = 3
+
+# === Counters ===
+total_segmentation_masks = 0
+total_bbox_masks_created = 0
+
+# === Loop through segmentation masks ===
+for root, _, files in os.walk(mask_dir):
+    for file in files:
+        if file.endswith(".png"):
+            total_segmentation_masks += 1
+            mask_path = os.path.join(root, file)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+            if mask is None or not np.any(mask):
+                continue
+
+            height, width = mask.shape
+            bbox_mask = np.zeros_like(mask, dtype=np.uint8)
+
+            labeled = label(mask > 0)
+            regions = regionprops(labeled)
+
+            for region in regions:
+                minr, minc, maxr, maxc = region.bbox
+
+                # Add padding, ensure bounds
+                x = max(minc - PADDING, 0)
+                y = max(minr - PADDING, 0)
+                x2 = min(maxc + PADDING, width)
+                y2 = min(maxr + PADDING, height)
+                w = x2 - x
+                h = y2 - y
+
+                # Draw rectangle
+                cv2.rectangle(bbox_mask, (x, y), (x + w, y + h), color=255, thickness=2)
+
+            if np.any(bbox_mask):
+                relative_path = os.path.relpath(mask_path, mask_dir)
+                save_path = os.path.join(bbox_output_dir, relative_path)
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                cv2.imwrite(save_path, bbox_mask)
+                total_bbox_masks_created += 1
+                print(f"Saved bbox mask: {save_path}")
+
+# === Summary ===
+print("\n--- Summary ---")
+print(f"Total segmentation masks found : {total_segmentation_masks}")
+print(f"Total bbox masks created       : {total_bbox_masks_created}")

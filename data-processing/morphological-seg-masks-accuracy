@@ -1,0 +1,174 @@
+import os
+import cv2
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from pycocotools import mask as mask_utils
+import matplotlib.pyplot as plt
+from skimage.measure import label, regionprops
+from matplotlib.patches import Patch
+
+
+def compute_mask_iou(mask1, mask2):
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return intersection / union if union > 0 else 0.0
+
+
+def decode_coco_segmentation(segmentation, height, width):
+    if isinstance(segmentation, list):
+        rles = mask_utils.frPyObjects(segmentation, height, width)
+        rle = mask_utils.merge(rles)
+    else:
+        rle = segmentation
+    return mask_utils.decode(rle).astype(bool)
+
+
+def evaluate_per_mask(
+    coco_json_path,
+    predicted_mask_dir,
+    output_excel_path,
+    image_root_dir,
+    iou_threshold=0.5
+):
+    with open(coco_json_path, 'r') as f:
+        coco_data = json.load(f)
+
+    image_info = {str(img['id']): img for img in coco_data['images']}
+    annotations = coco_data['annotations']
+
+    results = []
+    predicted_files = list(Path(predicted_mask_dir).rglob("*.png"))
+    print(f"🔍 Found {len(predicted_files)} predicted mask files.")
+
+    for pred_path in predicted_files:
+        image_id = pred_path.stem
+        if image_id not in image_info:
+            continue
+
+        pred_mask = cv2.imread(str(pred_path), cv2.IMREAD_GRAYSCALE)
+        if pred_mask is None:
+            continue
+        pred_mask = pred_mask > 0
+
+        img_meta = image_info[image_id]
+        height, width = img_meta['height'], img_meta['width']
+
+        gt_masks = [
+            decode_coco_segmentation(ann['segmentation'], height, width)
+            for ann in annotations if str(ann['image_id']) == image_id
+        ]
+
+        if not gt_masks:
+            continue
+
+        areas = [mask.sum() for mask in gt_masks]
+        avg_gt_area = np.mean(areas) if areas else 0
+
+        # --- Extract predicted regions ---
+        labeled_pred = label(pred_mask)
+        pred_regions = regionprops(labeled_pred)
+        pred_masks = [(labeled_pred == r.label) for r in pred_regions]
+
+        matched_gt = set()
+        matched_pred = set()
+        ious = []
+
+        for i, gt_mask in enumerate(gt_masks):
+            best_iou = 0
+            best_j = -1
+            for j, pred_mask_bin in enumerate(pred_masks):
+                if j in matched_pred:
+                    continue
+                iou = compute_mask_iou(gt_mask, pred_mask_bin)
+                if iou >= iou_threshold and iou > best_iou:
+                    best_iou = iou
+                    best_j = j
+
+            if best_j != -1:
+                matched_gt.add(i)
+                matched_pred.add(best_j)
+                ious.append(best_iou)
+
+        TP = len(matched_gt)
+        FN = len(gt_masks) - TP
+        FP = len(pred_masks) - len(matched_pred)
+
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+        accuracy = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        avg_iou = np.mean(ious) if ious else 0
+
+        results.append({
+            "image_id": image_id,
+            "TP": TP,
+            "FP": FP,
+            "FN": FN,
+            "Precision": precision,
+            "Recall": recall,
+            "Accuracy": accuracy,
+            "F1 Score": f1,
+            "Avg IOU": avg_iou,
+            "Avg GT Area": avg_gt_area
+        })
+
+        # === Visualization ===
+        combined_gt = np.zeros((height, width), dtype=bool)
+        for gt_mask in gt_masks:
+            combined_gt = np.logical_or(combined_gt, gt_mask)
+
+        combined_pred = np.zeros((height, width), dtype=bool)
+        for pm in pred_masks:
+            combined_pred = np.logical_or(combined_pred, pm)
+
+        intersection = np.logical_and(combined_gt, combined_pred)
+        only_gt = np.logical_and(combined_gt, ~combined_pred)
+        only_pred = np.logical_and(combined_pred, ~combined_gt)
+
+        original_image_path = next(Path(image_root_dir).rglob(f"{image_id}.*"), None)
+        if original_image_path:
+            original_img = cv2.imread(str(original_image_path))
+            if original_img is not None:
+                overlay = original_img.copy()
+                overlay[only_gt] = [0, 100, 0]         # Dark Green: GT only
+                overlay[only_pred] = [0, 0, 255]       # Blue: Pred only
+                overlay[intersection] = [0, 255, 255]  # Cyan: Overlap
+
+                plt.figure(figsize=(8, 8))
+                plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+                plt.title(f"{image_id} | TP={TP}, FP={FP}, FN={FN}")
+
+                legend_elements = [
+                    Patch(facecolor=(0, 100/255, 0), label='Ground Truth'),
+                    Patch(facecolor=(1, 0, 0), label='Prediction'),
+                    Patch(facecolor=(1, 1, 0), label='Overlap'),
+                ]
+                plt.legend(handles=legend_elements, loc='lower right')
+                plt.axis("off")
+                plt.show()
+            else:
+                print(f" Could not load original image: {original_image_path}")
+        else:
+            print(f" Original image not found for: {image_id}")
+
+        if len(pred_masks) == 0:
+            print(f" No predicted regions for image: {image_id}")
+
+    if not results:
+        print(" No evaluation results were collected.")
+        return
+
+    df = pd.DataFrame(results)
+    df.to_excel(output_excel_path, index=False)
+    print(f" Saved segmentation evaluation to: {output_excel_path}")
+
+
+# === Run it ===
+evaluate_per_mask(
+    coco_json_path="/content/drive/MyDrive/filament-detection-project/data/magfilo_2024_v1.0.json",
+    predicted_mask_dir="/content/drive/MyDrive/filament-detection-project/data/YOLO-data/morph-masks",
+    output_excel_path="/content/drive/MyDrive/filament-detection-project/data/YOLO-data/eval_segmentation_results.xlsx",
+    image_root_dir="/content/drive/MyDrive/filament-detection-project/data/YOLO-data/gong-processed-jpgs"
+)

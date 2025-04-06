@@ -8,9 +8,9 @@ from skimage.measure import label, regionprops
 from multiprocessing import Pool, cpu_count
 
 # Thresholds and parameters
-PIXEL_INTENSITY_THRESHOLD = 100
-FILAMENT_MIN_AREA = 450
-REMOVE_SMALL_DOTS_AREA = 100  # Remove tiny connected noise before processing
+PIXEL_INTENSITY_THRESHOLD = 60
+FILAMENT_MIN_AREA = 350
+REMOVE_SMALL_DOTS_AREA = 300  # Remove tiny connected noise before processing
 
 # Eight linear structuring elements (15x15 approximations)
 directions = [
